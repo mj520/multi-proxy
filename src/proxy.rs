@@ -553,31 +553,72 @@ pub async fn serve(
 
     let timeout = Duration::from_secs(connect_timeout_secs);
 
+    // Graceful shutdown: exit the accept loop on Ctrl+C (SIGINT) or SIGTERM.
+    // Without this, as PID 1 in a container the process would ignore the signal
+    // and `docker run --rm` could never reap the container.
+    let mut shutdown = Box::pin(async {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => info!("Received SIGINT, shutting down"),
+            _ = unix::signal_unix() => info!("Received SIGTERM, shutting down"),
+        }
+    });
+
     loop {
-        match listener.accept().await {
-            Ok((stream, addr)) => {
-                let manager = manager.clone();
-                let timeout = timeout;
-
-                tokio::spawn(async move {
-                    let io = TokioIo::new(stream);
-
-                    let service = service_fn(move |req| {
-                        let manager = manager.clone();
-                        handle_request(req, manager, strategy, timeout)
-                    });
-
-                    if let Err(e) = http1::Builder::new()
-                        .serve_connection(io, service)
-                        .await
-                    {
-                        error!("Error serving connection from {}: {}", addr, e);
-                    }
-                });
+        tokio::select! {
+            _ = &mut shutdown => {
+                info!("Shutdown signal received; stopping accept loop");
+                break;
             }
-            Err(e) => {
-                error!("Failed to accept connection: {}", e);
+            res = listener.accept() => {
+                match res {
+                    Ok((stream, addr)) => {
+                        let manager = manager.clone();
+                        let timeout = timeout;
+
+                        tokio::spawn(async move {
+                            let io = TokioIo::new(stream);
+
+                            let service = service_fn(move |req| {
+                                let manager = manager.clone();
+                                handle_request(req, manager, strategy, timeout)
+                            });
+
+                            if let Err(e) = http1::Builder::new()
+                                .serve_connection(io, service)
+                                .await
+                            {
+                                error!("Error serving connection from {}: {}", addr, e);
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        error!("Failed to accept connection: {}", e);
+                    }
+                }
             }
         }
+    }
+
+    info!("Server stopped");
+    Ok(())
+}
+
+/// Platform-specific SIGTERM handling.
+#[cfg(unix)]
+mod unix {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    pub async fn signal_unix() {
+        let mut sigterm = signal(SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        sigterm.recv().await;
+    }
+}
+
+#[cfg(not(unix))]
+mod unix {
+    /// On non-Unix (Windows) there is no SIGTERM; ctrl_c() handles Ctrl+C.
+    pub async fn signal_unix() {
+        std::future::pending::<()>().await;
     }
 }
