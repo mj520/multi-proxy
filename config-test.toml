@@ -1,9 +1,0 @@
-host = "127.0.0.1"
-port = 12380
-strategy = "order"
-probe_interval = 600
-connect_timeout = 3
-
-upstreams = [
-  "socks5://127.0.0.1:1080"
-]

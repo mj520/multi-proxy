@@ -43,7 +43,7 @@ WORKDIR /app
 COPY --from=builder /app/target/release/multi-proxy /app/multi-proxy
 
 # Copy default config
-COPY config-test.toml /app/config.toml
+COPY config.toml /app/config.toml
 
 # Set ownership
 RUN chown -R proxy:proxy /app

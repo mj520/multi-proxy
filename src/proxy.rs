@@ -220,6 +220,44 @@ async fn forward_channel(
     }
 }
 
+/// Forward request directly to the origin server, bypassing all upstream
+/// proxies. Used as last-resort fallback when every channel fails.
+/// NOTE: exposes the client's real IP (no proxy), so only used as fallback.
+async fn direct_forward(
+    target: &str,
+    original_request: &[u8],
+    timeout_dur: Duration,
+) -> Result<Vec<u8>, String> {
+    let (host, port, is_https) = parse_target(target)?;
+    let addr = format!("{}:{}", host, port);
+
+    let stream = timeout(timeout_dur, TcpStream::connect(&addr))
+        .await
+        .map_err(|_| "Direct connection timeout")?
+        .map_err(|e| format!("Direct connect failed: {}", e))?;
+
+    if is_https {
+        use native_tls::TlsConnector;
+        use tokio_native_tls::TlsConnector as TokioTlsConnector;
+
+        let tls_connector = TlsConnector::new()
+            .map_err(|e| format!("TLS connector error: {}", e))?;
+        let tls_connector = TokioTlsConnector::from(tls_connector);
+
+        let mut tls_stream = tls_connector.connect(&host, stream).await
+            .map_err(|e| format!("Direct TLS handshake failed: {}", e))?;
+
+        tls_stream.write_all(original_request).await.map_err(|e| e.to_string())?;
+        tls_stream.flush().await.map_err(|e| e.to_string())?;
+        return read_full_response(&mut tls_stream, timeout_dur).await;
+    }
+
+    let mut stream = stream;
+    stream.write_all(original_request).await.map_err(|e| e.to_string())?;
+    stream.flush().await.map_err(|e| e.to_string())?;
+    read_full_response(&mut stream, timeout_dur).await
+}
+
 /// Build HTTP response from raw bytes, preserving all upstream headers.
 /// Parses the upstream HTTP response line + headers and reconstructs
 /// a hyper Response with the exact same headers intact, body = upstream body only.
@@ -447,9 +485,23 @@ async fn handle_request(
         }
     }
 
-    // All candidate channels failed
-    error!("All channels failed. Last error: {}", last_err);
-    Ok(error_response(StatusCode::BAD_GATEWAY, &format!("All channels failed. Last: {}", last_err)))
+    // All channels failed — last-resort fallback: connect directly to origin.
+    // This exposes the client's real IP (no proxy), so it is only used when
+    // every upstream channel is unavailable, to keep service reachable.
+    warn!("All channels failed ({}); falling back to direct origin connection", last_err);
+    match direct_forward(&target, &original_request, timeout_dur).await {
+        Ok(response_data) => {
+            info!("Direct origin fallback succeeded for {}", target);
+            Ok(raw_response(response_data))
+        }
+        Err(e) => {
+            error!("All channels failed and direct fallback also failed: {}", e);
+            Ok(error_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("All channels failed and direct connection failed: {} | {}", last_err, e),
+            ))
+        }
+    }
 }
 
 /// Start the proxy server.
