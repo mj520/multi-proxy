@@ -1,0 +1,34 @@
+[package]
+name = "multi-proxy"
+version = "0.1.0"
+edition = "2024"
+description = "Lightweight multi-channel proxy tool with HTTP/SOCKS5/SSH tunnel support"
+license = "MIT"
+authors = ["multi-proxy contributors"]
+rust-version = "1.85"
+
+[dependencies]
+tokio = { version = "1.35", features = ["full"] }
+hyper = { version = "1.1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full", "server", "client"] }
+http-body-util = "0.1"
+bytes = "1.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.4", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+url = "2.5"
+native-tls = "0.2"
+tokio-native-tls = "0.3"
+parking_lot = "0.12"
+sha2 = "0.10"
+russh = "0.45"
+russh-keys = "0.45"
+async-trait = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

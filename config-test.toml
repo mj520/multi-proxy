@@ -1,0 +1,8 @@
+listen = "127.0.0.1:8080"
+strategy = "order"
+probe_interval = 600
+connect_timeout = 3
+
+upstreams = [
+  "socks5://127.0.0.1:1080"
+]
