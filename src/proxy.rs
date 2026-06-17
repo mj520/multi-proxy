@@ -16,7 +16,7 @@ use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 use crate::dsn::Dsn;
-use crate::upstream::ChannelManager;
+use crate::upstream::{Channel, ChannelManager};
 use crate::strategy::Strategy;
 use crate::upstream::ssh as ssh_tunnel;
 use ssh_tunnel::forward_raw as ssh_forward;
@@ -468,14 +468,68 @@ async fn handle_request(
         usable
     };
 
-    // Try candidate channels in order with automatic fallback
-    let mut last_err = String::new();
+    // Attempt order depends on config.direct_first:
+    //   false (default): proxy channels first, direct-to-origin as last resort.
+    //   true:             direct-to-origin first, proxy channels as last resort.
+    if manager.direct_first() {
+        match direct_forward(&target, &original_request, timeout_dur).await {
+            Ok(response_data) => {
+                debug!("Direct origin connection succeeded for {}", target);
+                return Ok(raw_response(response_data));
+            }
+            Err(e) => {
+                warn!("Direct origin failed ({}); trying proxy channels", e);
+            }
+        }
+        return match try_channels(&manager, &candidates, &target, &original_request, timeout_dur).await {
+            Ok(response_data) => Ok(raw_response(response_data)),
+            Err(chan_err) => {
+                error!("Direct connection and all channels failed: {}", chan_err);
+                Ok(error_response(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("Direct connection and all channels failed: {}", chan_err),
+                ))
+            }
+        };
+    }
 
-    for channel in &candidates {
-        match forward_channel(&channel.dsn, &target, &original_request, timeout_dur).await {
+    // Proxy-first: try channels, then direct-to-origin as last resort.
+    match try_channels(&manager, &candidates, &target, &original_request, timeout_dur).await {
+        Ok(response_data) => Ok(raw_response(response_data)),
+        Err(chan_err) => {
+            warn!("All channels failed ({}); trying direct origin connection", chan_err);
+            match direct_forward(&target, &original_request, timeout_dur).await {
+                Ok(response_data) => {
+                    info!("Direct origin connection succeeded for {}", target);
+                    Ok(raw_response(response_data))
+                }
+                Err(dir_err) => {
+                    error!("All channels and direct connection failed: {} | {}", chan_err, dir_err);
+                    Ok(error_response(
+                        StatusCode::BAD_GATEWAY,
+                        &format!("All channels and direct connection failed: {} | {}", chan_err, dir_err),
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// Try candidate channels in order; mark healthy/unhealthy accordingly.
+/// Returns Ok on first success, or Err(last error) if all fail.
+async fn try_channels(
+    manager: &ChannelManager,
+    candidates: &[&Channel],
+    target: &str,
+    original_request: &[u8],
+    timeout_dur: Duration,
+) -> Result<Vec<u8>, String> {
+    let mut last_err = String::from("no channels attempted");
+    for channel in candidates {
+        match forward_channel(&channel.dsn, target, original_request, timeout_dur).await {
             Ok(response_data) => {
                 manager.mark_healthy(channel.id);
-                return Ok(raw_response(response_data));
+                return Ok(response_data);
             }
             Err(e) => {
                 warn!("Channel {} ({:?}) failed: {}", channel.id, channel.dsn, e);
@@ -484,24 +538,7 @@ async fn handle_request(
             }
         }
     }
-
-    // All channels failed — last-resort fallback: connect directly to origin.
-    // This exposes the client's real IP (no proxy), so it is only used when
-    // every upstream channel is unavailable, to keep service reachable.
-    warn!("All channels failed ({}); falling back to direct origin connection", last_err);
-    match direct_forward(&target, &original_request, timeout_dur).await {
-        Ok(response_data) => {
-            info!("Direct origin fallback succeeded for {}", target);
-            Ok(raw_response(response_data))
-        }
-        Err(e) => {
-            error!("All channels failed and direct fallback also failed: {}", e);
-            Ok(error_response(
-                StatusCode::BAD_GATEWAY,
-                &format!("All channels failed and direct connection failed: {} | {}", last_err, e),
-            ))
-        }
-    }
+    Err(last_err)
 }
 
 /// Start the proxy server.

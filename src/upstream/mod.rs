@@ -151,4 +151,9 @@ impl ChannelManager {
     pub fn get_dsn(&self, id: usize) -> Option<Dsn> {
         self.channels.read().get(id).map(|c| c.dsn.clone())
     }
+
+    /// Whether direct-to-origin is attempted before proxy channels.
+    pub fn direct_first(&self) -> bool {
+        self.config.direct_first
+    }
 }

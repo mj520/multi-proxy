@@ -3,7 +3,7 @@ port = 12380
 strategy = "order"
 probe_interval = 600
 connect_timeout = 3
-
+direct_first = false
 upstreams = [
   "ssh://root@127.0.0.1",
   "socks5://127.0.0.1:1080",

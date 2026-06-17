@@ -50,6 +50,12 @@ pub struct Config {
     #[serde(default)]
     pub strategy: ConfigStrategy,
 
+    /// When true, connect directly to the origin first; use proxy channels as
+    /// fallback. When false (default), try proxy channels first and fall back to
+    /// direct connection only when all channels fail.
+    #[serde(default)]
+    pub direct_first: bool,
+
     /// Interval in seconds for upstream health checks.
     #[serde(default = "default_probe_interval")]
     pub probe_interval: u64,
@@ -84,6 +90,7 @@ impl Default for Config {
             host: default_host(),
             port: default_port(),
             strategy: ConfigStrategy::Order,
+            direct_first: false,
             probe_interval: default_probe_interval(),
             connect_timeout: default_connect_timeout(),
             upstreams: Vec::new(),
@@ -114,6 +121,11 @@ pub struct Args {
     #[arg(short)]
     pub strategy: Option<String>,
 
+    /// Connect directly to origin first; use proxy channels as fallback.
+    /// Accepts --direct-first (=true) or --direct-first=false (env: DIRECT_FIRST).
+    #[arg(long, env = "DIRECT_FIRST", num_args = 0..=1, default_missing_value = "true")]
+    pub direct_first: Option<bool>,
+
     /// Additional upstream DSNs (can be used multiple times).
     #[arg(short, long)]
     pub upstream: Vec<String>,
@@ -142,6 +154,9 @@ impl Config {
         }
         if let Some(strategy) = &args.strategy {
             config.strategy = strategy.parse()?;
+        }
+        if let Some(v) = args.direct_first {
+            config.direct_first = v;
         }
         config.upstreams.extend(args.upstream.clone());
 
