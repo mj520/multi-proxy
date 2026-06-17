@@ -328,6 +328,21 @@ async fn handle_request(
 ) -> Result<Response<Full<Bytes>>, Box<dyn std::error::Error + Send + Sync>> {
     let path = req.uri().path().to_string();
 
+    // Liveness probe endpoint (short-circuit before proxy routing)
+    if path == "/health" {
+        let healthy_count = manager.healthy_channels().len();
+        let total = manager.channels().len();
+        let body = format!(
+            "{{\"status\":\"ok\",\"healthy\":{},\"total\":{}}}",
+            healthy_count, total
+        );
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .body(Full::new(Bytes::from(body)))
+            .unwrap());
+    }
+
     // Validate path format
     let (target, _is_https) = match parse_path(&path) {
         Ok(t) => t,

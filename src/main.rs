@@ -72,8 +72,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start SSH session idle-reaper
     ssh::start_idle_reaper();
 
-    // Parse listen address
-    let listen_addr: SocketAddr = config.listen.parse()?;
+    // Parse listen address (host may be IPv4 or IPv6)
+    let ip: std::net::IpAddr = config.host.parse()?;
+    let listen_addr = SocketAddr::new(ip, config.port);
     info!("Listening on {}", listen_addr);
 
     // Start proxy server

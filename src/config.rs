@@ -1,6 +1,6 @@
 //! Configuration module for multi-proxy.
 //!
-//! Loads settings from config.toml and CLI arguments.
+//! Loads settings from config.toml, CLI flags, and environment variables.
 
 use clap::Parser;
 use serde::Deserialize;
@@ -38,9 +38,13 @@ impl FromStr for ConfigStrategy {
 /// Application configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    /// Listen address for the HTTP proxy server.
-    #[serde(default = "default_listen")]
-    pub listen: String,
+    /// Bind host for the HTTP proxy server (IPv4 or IPv6).
+    #[serde(default = "default_host")]
+    pub host: String,
+
+    /// Bind port for the HTTP proxy server.
+    #[serde(default = "default_port")]
+    pub port: u16,
 
     /// Load balancing strategy.
     #[serde(default)]
@@ -58,8 +62,12 @@ pub struct Config {
     pub upstreams: Vec<String>,
 }
 
-fn default_listen() -> String {
-    "127.0.0.1:8080".to_string()
+fn default_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_port() -> u16 {
+    12380
 }
 
 fn default_probe_interval() -> u64 {
@@ -73,7 +81,8 @@ fn default_connect_timeout() -> u64 {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            listen: default_listen(),
+            host: default_host(),
+            port: default_port(),
             strategy: ConfigStrategy::Order,
             probe_interval: default_probe_interval(),
             connect_timeout: default_connect_timeout(),
@@ -83,15 +92,23 @@ impl Default for Config {
 }
 
 /// CLI arguments for runtime overrides.
+///
+/// `host`/`port` are bound to the `HOST`/`PORT` environment variables; a flag
+/// wins over the env var (clap merges both). Priority overall:
+/// CLI flag > env var > config file > default.
 #[derive(Debug, Parser)]
 pub struct Args {
     /// Path to configuration file.
     #[arg(short, long, default_value = "config.toml")]
     pub config: PathBuf,
 
-    /// Override listen address.
-    #[arg(short, long)]
-    pub listen: Option<String>,
+    /// Override bind host (env: HOST).
+    #[arg(long, env = "HOST")]
+    pub host: Option<String>,
+
+    /// Override bind port (env: PORT).
+    #[arg(short, long, env = "PORT")]
+    pub port: Option<String>,
 
     /// Override strategy.
     #[arg(short)]
@@ -103,7 +120,7 @@ pub struct Args {
 }
 
 impl Config {
-    /// Load configuration from file and merge with CLI arguments.
+    /// Load configuration from file and merge with CLI/env overrides.
     pub fn load(args: &Args) -> Result<Self, String> {
         let mut config = if args.config.exists() {
             let content = std::fs::read_to_string(&args.config)
@@ -114,9 +131,14 @@ impl Config {
             Config::default()
         };
 
-        // Apply CLI overrides
-        if let Some(listen) = &args.listen {
-            config.listen = listen.clone();
+        // Apply overrides (clap already merged CLI flag + env var, flag wins).
+        if let Some(host) = &args.host {
+            config.host = host.clone();
+        }
+        if let Some(port) = &args.port {
+            config.port = port
+                .parse()
+                .map_err(|e| format!("Invalid PORT '{}': {}", port, e))?;
         }
         if let Some(strategy) = &args.strategy {
             config.strategy = strategy.parse()?;
@@ -143,7 +165,8 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Config::default();
-        assert_eq!(config.listen, "127.0.0.1:8080");
+        assert_eq!(config.host, "127.0.0.1");
+        assert_eq!(config.port, 12380);
         assert_eq!(config.strategy, ConfigStrategy::Order);
     }
 

@@ -25,8 +25,7 @@ cargo build --release
 路径必须以 `/https://` 开头。
 ```
 http://代理IP:端口/https://目标地址
-curl http://127.0.0.1:8080/https://github.com
-curl http://127.0.0.1:8080/https://ipinfo.io/ip
+curl http://127.0.0.1:12380/https://ipinfo.io/ip
 ```
 
 ### 通道 DSN 格式
@@ -48,22 +47,9 @@ ssh://root@host?key=~/.ssh/id_rsa&keepalive=30
 ### 配置文件
 
 默认读取 `config.toml`：
-
-```toml
-listen = "127.0.0.1:8080"
-strategy = "order"
-probe_interval = 10
-connect_timeout = 3
-
-upstreams = [
-  "ssh://root:123456@127.0.0.1",
-  "socks5://127.0.0.1:1080",
-  "http://127.0.0.1:1080"
-]
-```
-
 参数说明：
-- `listen`: 监听地址
+- `host`: 监听主机（默认 `127.0.0.1`）
+- `port`: 监听端口（默认 `12380`）
 - `strategy`: `order` 顺序降级 / `hash` 哈希会话保持
 - `probe_interval`: 探活间隔（秒）
 - `connect_timeout`: 连接超时（秒）
@@ -74,14 +60,17 @@ upstreams = [
 ```bash
 ./multi-proxy -c ./config.toml
 ./multi-proxy \
-  -l 0.0.0.0:8080 \
+  --host 0.0.0.0 --port 12380 \
   -s order \
   -u "ssh://root@127.0.0.1"
+
+# 等价写法：通过环境变量（flag 优先级高于环境变量）
+HOST=0.0.0.0 PORT=12380 ./multi-proxy -c ./config.toml
 ```
 
 参数说明：
 - `-c`: 指定配置文件
-- `-l`: 临时修改监听地址
+- `--host` / `--port`: 临时修改监听主机/端口（对应环境变量 `HOST`/`PORT`，flag 优先）
 - `-s`: 临时修改调度策略
 - `-u`: 临时添加上游通道（可多次使用）
 

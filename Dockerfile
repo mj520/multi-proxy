@@ -23,15 +23,19 @@ RUN cargo build --release --bin multi-proxy
 FROM debian:bookworm-slim
 # (rust:1.88-slim-bookworm builder above; runtime = debian slim)
 
-# Install runtime dependencies (curl for HEALTHCHECK)
+# Default bind (HOST=0.0.0.0 so port-mapping can reach the container).
+# Override either or both at runtime: docker run -e PORT=9090 -e HOST=0.0.0.0 ...
+ENV HOST=0.0.0.0
+ENV PORT=12380
+
+# Install runtime dependencies (TLS roots for HTTPS)
 RUN apt-get update && apt-get install -y \
     libssl3 \
     ca-certificates \
-    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user
-RUN useradd -m -s /bin/bash proxy
+# Create non-root user (skip if already exists)
+RUN getent passwd proxy || useradd -m -s /bin/bash proxy
 
 WORKDIR /app
 
@@ -47,12 +51,8 @@ RUN chown -R proxy:proxy /app
 # Switch to non-root user
 USER proxy
 
-# Expose proxy port
-EXPOSE 8080
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8080/http://127.0.0.1 || exit 1
+# Expose proxy port (matches default PORT; override -e PORT=… at runtime)
+EXPOSE 12380
 
 ENTRYPOINT ["/app/multi-proxy"]
 CMD ["-c", "/app/config.toml"]
