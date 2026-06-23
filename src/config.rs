@@ -8,19 +8,14 @@ use std::path::PathBuf;
 use crate::dsn::Dsn;
 
 /// Load balancing strategy for upstream selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ConfigStrategy {
     /// Order-based fallback: try channels sequentially.
+    #[default]
     Order,
     /// Hash-based session affinity: consistent hashing by target URL.
     Hash,
-}
-
-impl Default for ConfigStrategy {
-    fn default() -> Self {
-        Self::Order
-    }
 }
 
 impl FromStr for ConfigStrategy {

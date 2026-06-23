@@ -52,7 +52,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|(i, dsn)| Channel::new(i, dsn))
         .collect();
 
-    if channels.is_empty() {
+    // direct_first with no channels still runs as a pure direct-to-origin proxy.
+    if channels.is_empty() && !config.direct_first {
         error!("No upstreams configured!");
         return Ok(());
     }
@@ -63,25 +64,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start health checker
     let health_manager = manager.clone();
-    let _health_handle = health::start_health_checker(
+    let health_handle = health::start_health_checker(
         health_manager,
         config.probe_interval,
         config.connect_timeout,
     );
 
     // Start SSH session idle-reaper
-    ssh::start_idle_reaper();
+    let reaper_handle = ssh::start_idle_reaper();
 
     // Parse listen address (host may be IPv4 or IPv6)
     let ip: std::net::IpAddr = config.host.parse()?;
     let listen_addr = SocketAddr::new(ip, config.port);
     info!("Listening on {}", listen_addr);
 
-    // Start proxy server
-    proxy::serve(
+    // Start proxy server (blocks until shutdown signal)
+    let result = proxy::serve(
         listen_addr,
         manager,
         strategy,
         config.connect_timeout,
-    ).await
+    ).await;
+
+    // Graceful shutdown: stop background tasks once the accept loop has exited.
+    health_handle.abort();
+    reaper_handle.abort();
+
+    result
 }

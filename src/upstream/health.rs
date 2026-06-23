@@ -1,7 +1,11 @@
 //! Health checking for upstream channels.
+//!
+//! Probes run concurrently (one task per channel) so an N-channel check
+//! completes in O(max timeout) rather than O(N × timeout).
 
 use std::time::Duration;
 use tokio::time::interval;
+use tokio::task::JoinSet;
 use tracing::{debug, info};
 use crate::dsn::Dsn;
 use crate::upstream::ChannelManager;
@@ -24,57 +28,47 @@ pub fn start_health_checker(
         run_check(&manager, timeout).await;
 
         let mut ticker = interval(probe_interval);
-        // Skip the first tick (already done)
+        // Skip the first tick (already done above)
         ticker.tick().await;
 
         loop {
             ticker.tick().await;
-
-            let channels = manager.channels();
-            debug!("Running health check for {} channels", channels.len());
-
-            for channel in channels.iter() {
-                let healthy = check_channel(&channel.dsn, timeout).await;
-                if healthy {
-                    manager.mark_healthy(channel.id);
-                } else {
-                    manager.mark_unhealthy(channel.id);
-                }
-            }
-
-            let healthy_count = manager.healthy_channels().len();
-            info!(
-                "Health check complete: {}/{} channels healthy",
-                healthy_count,
-                channels.len()
-            );
+            run_check(&manager, timeout).await;
         }
     })
 }
 
-/// Run a single health check pass.
+/// Run a single health check pass — probes all channels concurrently.
 async fn run_check(manager: &ChannelManager, timeout: Duration) {
     let channels = manager.channels();
-    debug!("Running initial health check for {} channels", channels.len());
+    debug!("Running health check for {} channels", channels.len());
 
-    for channel in channels.iter() {
-        let healthy = check_channel(&channel.dsn, timeout).await;
-        if healthy {
-            manager.mark_healthy(channel.id);
-        } else {
-            manager.mark_unhealthy(channel.id);
+    let mut set: JoinSet<(usize, bool)> = JoinSet::new();
+    for channel in &channels {
+        let dsn = channel.dsn.clone();
+        let id = channel.id;
+        set.spawn(async move { (id, check_channel(&dsn, timeout).await) });
+    }
+
+    let total = channels.len();
+    while let Some(res) = set.join_next().await {
+        match res {
+            Ok((id, healthy)) => {
+                if healthy {
+                    manager.mark_healthy(id);
+                } else {
+                    manager.mark_unhealthy(id);
+                }
+            }
+            Err(e) => debug!("Health probe task panicked: {}", e),
         }
     }
 
     let healthy_count = manager.healthy_channels().len();
-    info!(
-        "Initial health check complete: {}/{} channels healthy",
-        healthy_count,
-        channels.len()
-    );
+    info!("Health check complete: {}/{} channels healthy", healthy_count, total);
 }
 
-/// Check health of a single channel.
+/// Check health of a single channel (TCP connectivity probe).
 async fn check_channel(dsn: &Dsn, timeout: Duration) -> bool {
     match dsn {
         Dsn::Http(http_dsn) => http_proxy::probe(http_dsn, timeout).await,

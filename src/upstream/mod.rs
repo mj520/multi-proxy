@@ -7,9 +7,29 @@ pub mod health;
 
 use std::sync::Arc;
 use parking_lot::RwLock;
-use tokio::sync::mpsc;
+use tokio::io::{AsyncRead, AsyncWrite};
 use crate::dsn::Dsn;
 use crate::config::Config;
+
+// ---------------------------------------------------------------------------
+// Unified bidirectional stream type
+// ---------------------------------------------------------------------------
+
+/// Object-safe trait alias combining AsyncRead + AsyncWrite for dynamic dispatch.
+///
+/// `dyn AsyncRead + AsyncWrite` is not a valid trait object (two non-auto traits),
+/// so we wrap them in a single marker trait and box that instead.
+/// `Sync` is required so bodies boxing the stream satisfy `BoxBody::new`.
+pub trait DynStream: AsyncRead + AsyncWrite + Send + Sync + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Sync + Unpin> DynStream for T {}
+
+/// Boxed, type-erased bidirectional byte stream.
+/// All channel types (TCP, TLS, SSH channel) unify into this.
+pub type BoxStream = Box<dyn DynStream>;
+
+// ---------------------------------------------------------------------------
+// Health tracking
+// ---------------------------------------------------------------------------
 
 /// Health status of an upstream channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,7 +45,7 @@ pub enum Health {
 /// An upstream channel with health tracking.
 #[derive(Debug, Clone)]
 pub struct Channel {
-    /// Unique channel ID.
+    /// Unique channel ID (index into the manager's channel list).
     pub id: usize,
     /// Parsed DSN configuration.
     pub dsn: Dsn,
@@ -71,10 +91,10 @@ impl Channel {
         if self.health != Health::Unhealthy {
             return true;
         }
-        // Backoff: exponential 3^n until 5 failures, then fixed max (300s)
-        // periodic recovery probe so a recovered node is never abandoned.
+        // Exponential backoff 3^n up to 5 failures, then fixed 300s so a
+        // recovered node is periodically re-probed rather than abandoned.
         let backoff = if self.failure_count > 5 {
-            300 // max interval: keep probing every 5 min for recovery
+            300
         } else {
             3u64.saturating_pow(self.failure_count.min(6)).min(300)
         };
@@ -85,13 +105,15 @@ impl Channel {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Channel manager
+// ---------------------------------------------------------------------------
+
 /// Manager for all upstream channels.
 #[derive(Clone)]
 pub struct ChannelManager {
     channels: Arc<RwLock<Vec<Channel>>>,
-    #[allow(dead_code)]
     config: Arc<Config>,
-    _shutdown_tx: Option<mpsc::Sender<()>>,
 }
 
 impl ChannelManager {
@@ -99,57 +121,36 @@ impl ChannelManager {
         Self {
             channels: Arc::new(RwLock::new(channels)),
             config,
-            _shutdown_tx: None,
         }
     }
 
-    /// Get number of channels.
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.channels.read().len()
-    }
-
-    /// Check if empty.
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.channels.read().is_empty()
-    }
-
-    /// Get all channels.
+    /// Get a snapshot of all channels.
     pub fn channels(&self) -> Vec<Channel> {
         self.channels.read().clone()
     }
 
-    /// Get healthy channels.
-    pub fn healthy_channels(&self) -> Vec<(usize, Channel)> {
-        let guard = self.channels.read();
-        guard.iter()
-            .enumerate()
-            .filter(|(_, c)| c.health == Health::Healthy && c.should_retry())
-            .map(|(i, c)| (i, c.clone()))
+    /// Get currently-healthy, usable channels.
+    pub fn healthy_channels(&self) -> Vec<Channel> {
+        self.channels
+            .read()
+            .iter()
+            .filter(|c| c.health == Health::Healthy && c.should_retry())
+            .cloned()
             .collect()
     }
 
     /// Mark channel as healthy.
     pub fn mark_healthy(&self, id: usize) {
-        let mut channels = self.channels.write();
-        if let Some(c) = channels.get_mut(id) {
+        if let Some(c) = self.channels.write().get_mut(id) {
             c.mark_healthy();
         }
     }
 
     /// Mark channel as unhealthy.
     pub fn mark_unhealthy(&self, id: usize) {
-        let mut channels = self.channels.write();
-        if let Some(c) = channels.get_mut(id) {
+        if let Some(c) = self.channels.write().get_mut(id) {
             c.mark_unhealthy();
         }
-    }
-
-    /// Get DSN by index.
-    #[allow(dead_code)]
-    pub fn get_dsn(&self, id: usize) -> Option<Dsn> {
-        self.channels.read().get(id).map(|c| c.dsn.clone())
     }
 
     /// Whether direct-to-origin is attempted before proxy channels.

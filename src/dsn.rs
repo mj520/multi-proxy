@@ -23,9 +23,7 @@ pub enum Dsn {
 pub struct HttpDsn {
     pub host: String,
     pub port: u16,
-    #[allow(dead_code)]
     pub user: Option<String>,
-    #[allow(dead_code)]
     pub pass: Option<String>,
 }
 
@@ -33,9 +31,7 @@ pub struct HttpDsn {
 pub struct Socks5Dsn {
     pub host: String,
     pub port: u16,
-    #[allow(dead_code)]
     pub user: Option<String>,
-    #[allow(dead_code)]
     pub pass: Option<String>,
 }
 

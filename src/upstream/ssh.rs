@@ -18,6 +18,11 @@ use russh_keys::*;
 use async_trait::async_trait;
 
 use crate::dsn::SshDsn;
+use super::BoxStream;
+
+// ---------------------------------------------------------------------------
+// SSH client handler
+// ---------------------------------------------------------------------------
 
 /// Simple SSH client handler.
 struct SimpleHandler;
@@ -30,6 +35,7 @@ impl client::Handler for SimpleHandler {
         &mut self,
         _server_public_key: &key::PublicKey,
     ) -> Result<bool, Self::Error> {
+        // In production, verify the server key against known hosts here.
         Ok(true)
     }
 }
@@ -38,28 +44,24 @@ impl client::Handler for SimpleHandler {
 fn get_default_key_path() -> Option<PathBuf> {
     let key_names = ["id_ed25519", "id_rsa", "id_ecdsa"];
 
-    if let Ok(home) = env::var("HOME") {
-        let ssh_dir = PathBuf::from(&home).join(".ssh");
-        for name in &key_names {
-            let key_path = ssh_dir.join(name);
-            if key_path.exists() {
-                return Some(key_path);
-            }
-        }
-    }
-
-    if let Ok(userprofile) = env::var("USERPROFILE") {
-        let ssh_dir = PathBuf::from(&userprofile).join(".ssh");
-        for name in &key_names {
-            let key_path = ssh_dir.join(name);
-            if key_path.exists() {
-                return Some(key_path);
+    for dir_var in ["HOME", "USERPROFILE"] {
+        if let Ok(dir) = env::var(dir_var) {
+            let ssh_dir = PathBuf::from(&dir).join(".ssh");
+            for name in &key_names {
+                let key_path = ssh_dir.join(name);
+                if key_path.exists() {
+                    return Some(key_path);
+                }
             }
         }
     }
 
     None
 }
+
+// ---------------------------------------------------------------------------
+// Connection pool
+// ---------------------------------------------------------------------------
 
 /// A reusable SSH session pool entry.
 struct SshPoolEntry {
@@ -71,7 +73,7 @@ struct SshPoolEntry {
     dsn_key: String,
 }
 
-/// Global SSH session pool (one entry for the SSH DSN).
+/// Global SSH session pool (one entry per DSN).
 /// Lazily initialized on first use, closed after 60s idle.
 struct SshPool {
     inner: RwLock<Option<SshPoolEntry>>,
@@ -79,7 +81,6 @@ struct SshPool {
 
 impl SshPool {
     /// Get or create a session. Updates last_used on access.
-    /// Returns the Arc<Mutex<Handle>> for the caller to lock during channel open.
     async fn get_or_connect(
         &self,
         dsn: &SshDsn,
@@ -193,153 +194,41 @@ static SSH_POOL: LazyLock<SshPool> = LazyLock::new(|| SshPool {
 /// Idle timeout for pooled SSH sessions.
 const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Start the background idle-reaper task. Call once from main at startup.
-pub fn start_idle_reaper() {
-    tokio::spawn(async move {
-        let mut ticker = interval(Duration::from_secs(30));
-        loop {
-            ticker.tick().await;
-            SSH_POOL.check_idle(SESSION_IDLE_TIMEOUT).await;
-        }
-    });
-}
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
 
-/// Forward request through SSH tunnel and return raw response.
-/// Handles HTTP (direct) and HTTPS (TLS over direct-tcpip channel).
-/// Reuses the pooled SSH session.
-pub async fn forward_raw(
+/// Establish a bidirectional stream to `target_host:target_port` through
+/// an SSH direct-tcpip channel. The returned stream is a raw TCP tunnel;
+/// callers wrap TLS themselves when forwarding HTTPS.
+pub async fn establish(
     dsn: &SshDsn,
-    target: &str,
-    request_data: &[u8],
+    target_host: &str,
+    target_port: u16,
     _timeout_dur: Duration,
-) -> Result<Vec<u8>, String> {
-    // Parse target
-    let target_clean = target
-        .strip_prefix("http://")
-        .or_else(|| target.strip_prefix("https://"))
-        .unwrap_or(target);
-
-    let is_https = target.starts_with("https://");
-
-    let parts: Vec<&str> = target_clean.split(':').collect();
-    let (target_domain, target_port) = if parts.len() >= 2 {
-        let port_str = parts[1].split('/').next().unwrap_or(parts[1]);
-        (
-            parts[0].to_string(),
-            port_str
-                .parse::<u16>()
-                .unwrap_or(if is_https { 443 } else { 80 }),
-        )
-    } else {
-        (
-            target_clean.split('/').next().unwrap_or(target_clean).to_string(),
-            if is_https { 443 } else { 80 },
-        )
-    };
-
+) -> Result<BoxStream, String> {
     // Get (or create) pooled SSH session
     let handle = SSH_POOL.get_or_connect(dsn).await?;
 
     debug!(
         "SSH tunnel to {}:{} via {}@{}",
-        target_domain, target_port, dsn.user, dsn.host
+        target_host, target_port, dsn.user, dsn.host
     );
 
-    // Lock during channel-open (serializes), release before forward
+    // Lock during channel-open (serializes), release before forwarding
     let channel = {
         let h = handle.lock().await;
-        h.channel_open_direct_tcpip(
-            target_domain.as_str(),
-            target_port as u32,
-            &dsn.host,
-            dsn.port as u32,
-        )
-        .await
-        .map_err(|e| format!("SSH channel open failed: {}", e))?
+        h.channel_open_direct_tcpip(target_host, target_port as u32, &dsn.host, dsn.port as u32)
+            .await
+            .map_err(|e| format!("SSH channel open failed: {}", e))?
     };
 
-    if is_https {
-        return ssh_tls_forward(channel, &target_domain, request_data).await;
-    }
-
-    ssh_http_forward(channel, request_data).await
-}
-
-/// Forward HTTP (plaintext) over an SSH channel.
-async fn ssh_http_forward(
-    mut channel: Channel<client::Msg>,
-    request_data: &[u8],
-) -> Result<Vec<u8>, String> {
-    channel.data(request_data).await.map_err(|e| e.to_string())?;
-
-    let mut response_buf = Vec::new();
-    loop {
-        match channel.wait().await {
-            Some(ChannelMsg::Data { ref data }) => {
-                response_buf.extend_from_slice(data);
-            }
-            Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
-            _ => {}
-        }
-    }
-
-    if response_buf.is_empty() {
-        return Err("Empty response from SSH tunnel".to_string());
-    }
-
-    Ok(response_buf)
-}
-
-/// Forward HTTPS over an SSH channel: convert channel to a stream, TLS handshake,
-/// then send request and read the full response.
-async fn ssh_tls_forward(
-    channel: Channel<client::Msg>,
-    host: &str,
-    request_data: &[u8],
-) -> Result<Vec<u8>, String> {
-    use native_tls::TlsConnector;
-    use tokio_native_tls::TlsConnector as TokioTlsConnector;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
+    // Convert russh channel into a tokio AsyncRead + AsyncWrite stream
     let stream = channel.into_stream();
-
-    let tls_connector =
-        TlsConnector::new().map_err(|e| format!("TLS connector error: {}", e))?;
-    let tls_connector = TokioTlsConnector::from(tls_connector);
-    let mut tls = tls_connector
-        .connect(host, stream)
-        .await
-        .map_err(|e| format!("TLS handshake failed: {}", e))?;
-
-    tls.write_all(request_data).await.map_err(|e| e.to_string())?;
-    tls.flush().await.map_err(|e| e.to_string())?;
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let mut response_buf = Vec::new();
-    let mut chunk = vec![0u8; 8192];
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        match timeout(remaining, tls.read(&mut chunk)).await {
-            Ok(Ok(0)) => break,
-            Ok(Ok(n)) => response_buf.extend_from_slice(&chunk[..n]),
-            Ok(Err(e)) => {
-                if response_buf.is_empty() {
-                    return Err(format!("TLS read error: {}", e));
-                }
-                break;
-            }
-            Err(_) => break,
-        }
-    }
-
-    if response_buf.is_empty() {
-        return Err("Empty HTTPS response from SSH tunnel".to_string());
-    }
-
-    Ok(response_buf)
+    Ok(Box::new(stream))
 }
 
-/// Check SSH server health.
+/// Check SSH server health (TCP reachability of the SSH port).
 pub async fn probe(dsn: &SshDsn, timeout_dur: Duration) -> bool {
     let addr = format!("{}:{}", dsn.host, dsn.port);
     match timeout(timeout_dur, TcpStream::connect(&addr)).await {
@@ -352,4 +241,20 @@ pub async fn probe(dsn: &SshDsn, timeout_dur: Duration) -> bool {
             false
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Idle reaper
+// ---------------------------------------------------------------------------
+
+/// Start the background idle-reaper task. Call once from main at startup.
+/// Returns the task handle so the caller can stop it during shutdown.
+pub fn start_idle_reaper() -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = interval(Duration::from_secs(30));
+        loop {
+            ticker.tick().await;
+            SSH_POOL.check_idle(SESSION_IDLE_TIMEOUT).await;
+        }
+    })
 }

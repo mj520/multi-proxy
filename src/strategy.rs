@@ -5,23 +5,27 @@ use sha2::{Sha256, Digest};
 /// Load balancing strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strategy {
-    /// Order-based fallback: sequential selection.
+    /// Order-based fallback: sequential selection by configured priority.
     Order,
-    /// Hash-based session affinity.
+    /// Hash-based session affinity: same target always starts at the same channel.
     Hash,
 }
 
 impl Strategy {
-    /// Select index based on strategy.
-    #[allow(dead_code)]
-    pub fn select(&self, total: usize, target: &str, fallback_idx: usize) -> usize {
+    /// Starting channel index for the given target.
+    ///
+    /// `Order` always starts at index 0 (highest priority first).
+    /// `Hash` derives a stable index from the target so the same destination
+    /// consistently maps to the same channel (session affinity); on failure
+    /// the remaining channels are tried in order after rotating from here.
+    pub(crate) fn start_index(&self, total: usize, target: &str) -> usize {
         match self {
-            Strategy::Order => fallback_idx,
+            Strategy::Order => 0,
             Strategy::Hash => Self::hash_index(total, target),
         }
     }
 
-    /// Calculate hash-based index for session affinity.
+    /// Stable hash → channel index in `[0, total)`.
     fn hash_index(total: usize, target: &str) -> usize {
         if total == 0 {
             return 0;
@@ -50,15 +54,15 @@ mod tests {
 
     #[test]
     fn test_hash_consistency() {
-        let idx1 = Strategy::Hash.select(5, "https://github.com", 0);
-        let idx2 = Strategy::Hash.select(5, "https://github.com", 0);
+        let idx1 = Strategy::Hash.start_index(5, "https://github.com");
+        let idx2 = Strategy::Hash.start_index(5, "https://github.com");
         assert_eq!(idx1, idx2);
     }
 
     #[test]
     fn test_hash_distribution() {
         let indices: Vec<usize> = (0..100)
-            .map(|i| Strategy::Hash.select(5, &format!("https://example.com/{}", i), 0))
+            .map(|i| Strategy::Hash.start_index(5, &format!("https://example.com/{}", i)))
             .collect();
 
         // Check distribution is reasonable (not all same)
@@ -67,8 +71,17 @@ mod tests {
     }
 
     #[test]
-    fn test_order_always_fallback() {
-        assert_eq!(Strategy::Order.select(5, "test", 2), 2);
-        assert_eq!(Strategy::Order.select(5, "test", 0), 0);
+    fn test_order_starts_at_zero() {
+        assert_eq!(Strategy::Order.start_index(5, "test"), 0);
+        assert_eq!(Strategy::Order.start_index(5, "anything"), 0);
+    }
+
+    #[test]
+    fn test_hash_in_range() {
+        for i in 0..200 {
+            let target = format!("https://example.com/{}", i);
+            let idx = Strategy::Hash.start_index(7, &target);
+            assert!(idx < 7);
+        }
     }
 }
